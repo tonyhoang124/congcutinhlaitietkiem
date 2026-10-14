@@ -1,98 +1,157 @@
 import streamlit as st
+import pandas as pd
+import numpy as np
+import yfinance as yf
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, LSTM
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+import plotly.graph_objects as go
+from datetime import timedelta
+import math
 
-def main():
-    st.set_page_config(page_title="Tính Lãi Tiết Kiệm", page_icon="💰", layout="centered")
-    
-    st.title("💰 Ứng dụng Tính Lãi Gửi Tiết Kiệm")
-    st.markdown("Nhập các thông tin bên dưới để tính toán số tiền lãi bạn sẽ nhận được.")
+# Thiết lập trang
+st.set_page_config(page_title="Dự báo giá cổ phiếu - LSTM", layout="wide")
+st.title("📈 Ứng dụng Phân tích và Dự báo giá Cổ phiếu bằng LSTM")
 
-    # Tạo form nhập liệu
-    with st.container():
-        st.subheader("1. Thông tin gửi tiền")
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            so_tien_gui = st.number_input("Số tiền gửi (VNĐ)", min_value=0.0, value=100000000.0, step=1000000.0, format="%f")
-            ky_han = st.number_input("Kỳ hạn (Tháng)", min_value=1, value=12, step=1)
-            
-        with col2:
-            lai_suat = st.number_input("Lãi suất (%/năm)", min_value=0.0, value=6.0, step=0.1)
-            loai_lai = st.radio("Loại lãi suất", options=["Lãi đơn", "Lãi kép"])
-            
-        hinh_thuc = st.selectbox("Hình thức lãnh lãi", 
-                                 options=["Lãnh lãi hàng tháng", "Lãnh lãi hàng quý", "Lãnh lãi cuối kỳ"])
+# Hàm tạo tập dữ liệu cho LSTM
+def create_dataset(dataset, time_step=60):
+    X, Y = [], []
+    for i in range(len(dataset) - time_step - 1):
+        a = dataset[i:(i + time_step), 0]
+        X.append(a)
+        Y.append(dataset[i + time_step, 0])
+    return np.array(X), np.array(Y)
 
-    # Xử lý tính toán
-    if st.button("Tính toán", type="primary", use_container_width=True):
-        st.subheader("2. Kết quả tính toán")
+# --- SIDEBAR: CẤU HÌNH ---
+st.sidebar.header("⚙️ Cấu hình dự báo")
+ticker = st.sidebar.text_input("Mã chứng khoán (VD: AAPL, VCB.VN, TSLA):", "AAPL")
+start_date = st.sidebar.date_input("Ngày bắt đầu lấy dữ liệu", pd.to_datetime("2020-01-01"))
+end_date = st.sidebar.date_input("Ngày kết thúc", pd.to_datetime("today"))
+future_days = st.sidebar.number_input("Số ngày muốn dự báo tương lai", min_value=1, max_value=365, value=10)
+epochs = st.sidebar.number_input("Số epochs huấn luyện (càng cao càng lâu)", min_value=1, max_value=200, value=10)
+
+if st.sidebar.button("🚀 Bắt đầu huấn luyện & Dự báo"):
+    with st.spinner('Đang tải dữ liệu và huấn luyện mô hình LSTM. Vui lòng đợi...'):
+        # 1. LẤY DỮ LIỆU
+        try:
+            df = yf.download(ticker, start=start_date, end=end_date)
+            if df.empty:
+                st.error("Không tìm thấy dữ liệu cho mã chứng khoán này. Vui lòng kiểm tra lại mã.")
+                st.stop()
+        except Exception as e:
+            st.error(f"Lỗi khi lấy dữ liệu: {e}")
+            st.stop()
+
+        # Tiền xử lý dữ liệu (Chỉ lấy cột Close)
+        data = df.filter(['Close'])
+        dataset = data.values
+        training_data_len = int(np.ceil(len(dataset) * .8)) # 80% train, 20% test
+
+        # Chuẩn hóa dữ liệu
+        scaler = MinMaxScaler(feature_range=(0, 1))
+        scaled_data = scaler.fit_transform(dataset)
+
+        # Tạo tập Train
+        train_data = scaled_data[0:int(training_data_len), :]
+        time_step = 60
+        x_train, y_train = create_dataset(train_data, time_step)
+        x_train = np.reshape(x_train, (x_train.shape[0], x_train.shape[1], 1))
+
+        # 2. XÂY DỰNG & HUẤN LUYỆN MÔ HÌNH LSTM
+        model = Sequential()
+        model.add(LSTM(50, return_sequences=True, input_shape=(x_train.shape[1], 1)))
+        model.add(LSTM(50, return_sequences=False))
+        model.add(Dense(25))
+        model.add(Dense(1))
+
+        model.compile(optimizer='adam', loss='mean_squared_error')
+        model.fit(x_train, y_train, batch_size=32, epochs=epochs, verbose=0)
+
+        # 3. ĐÁNH GIÁ MÔ HÌNH TRÊN TẬP TEST
+        test_data = scaled_data[training_data_len - time_step:, :]
+        x_test, y_test_actual = create_dataset(test_data, time_step)
+        x_test = np.reshape(x_test, (x_test.shape[0], x_test.shape[1], 1))
         
-        # Đưa lãi suất về số thập phân
-        r = lai_suat / 100.0
+        y_test_actual_unscaled = dataset[training_data_len:] # Thực tế
         
-        # Xác định số tháng của mỗi kỳ trả lãi
-        if hinh_thuc == "Lãnh lãi hàng tháng":
-            f = 1
-        elif hinh_thuc == "Lãnh lãi hàng quý":
-            f = 3
-        else: # Cuối kỳ
-            f = ky_han
-            
-        # Kiểm tra tính hợp lệ của kỳ hạn so với hình thức lãnh lãi
-        if ky_han % f != 0:
-            st.warning(f"Lưu ý: Kỳ hạn ({ky_han} tháng) không chia hết cho chu kỳ lãnh lãi ({f} tháng). Kết quả dưới đây được tính theo số kỳ chẵn.")
-            
-        so_ky = ky_han // f
+        predictions = model.predict(x_test)
+        predictions = scaler.inverse_transform(predictions) # Dự báo
+
+        # Chỉ số đánh giá
+        rmse = math.sqrt(mean_squared_error(y_test_actual_unscaled[:len(predictions)], predictions))
+        mae = mean_absolute_error(y_test_actual_unscaled[:len(predictions)], predictions)
+
+        # 4. DỰ BÁO TƯƠNG LAI
+        last_60_days = scaled_data[-60:]
+        current_step = last_60_days.reshape(1, time_step, 1)
         
-        # Biến lưu kết quả
-        lai_dinh_ky = 0.0
-        tong_lai = 0.0
-        tong_tien = 0.0
+        future_predictions = []
+        for _ in range(future_days):
+            pred_scaled = model.predict(current_step)
+            future_predictions.append(pred_scaled[0, 0])
+            # Thêm dự báo mới vào sequence và loại bỏ ngày cũ nhất
+            current_step = np.append(current_step[:, 1:, :], [[pred_scaled[0]]], axis=1)
         
-        if loai_lai == "Lãi đơn":
-            # Lãi đơn: Lãi không cộng dồn vào gốc
-            lai_dinh_ky = so_tien_gui * r * (f / 12)
-            tong_lai = lai_dinh_ky * so_ky
-            tong_tien = so_tien_gui + tong_lai
-            
-            ghi_chu_lai_dinh_ky = f"{lai_dinh_ky:,.0f} VNĐ"
-            
+        future_predictions = scaler.inverse_transform(np.array(future_predictions).reshape(-1, 1))
+
+        # Tính toán ngày cho dự báo tương lai
+        last_date = df.index[-1]
+        future_dates = [last_date + timedelta(days=i) for i in range(1, future_days + 1)]
+        
+        # 5. HIỂN THỊ KẾT QUẢ TÓM TẮT
+        st.subheader("1. 📊 Tóm tắt dự báo Lãi / Lỗ")
+        last_price = float(df['Close'].iloc[-1])
+        final_predicted_price = float(future_predictions[-1])
+        price_diff = final_predicted_price - last_price
+        pct_change = (price_diff / last_price) * 100
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Giá hiện tại (Phiên cuối)", f"{last_price:.2f}")
+        col2.metric(f"Giá dự báo (Sau {future_days} ngày)", f"{final_predicted_price:.2f}")
+        
+        if price_diff > 0:
+            col3.metric("Dự báo xu hướng", f"+{price_diff:.2f} (+{pct_change:.2f}%) 📈 LÃI", delta_color="normal")
         else:
-            # Lãi kép: Lãi cộng dồn vào gốc sau mỗi kỳ
-            tong_tien = so_tien_gui * ((1 + r * (f / 12)) ** so_ky)
-            tong_lai = tong_tien - so_tien_gui
-            
-            if hinh_thuc == "Lãnh lãi cuối kỳ":
-                ghi_chu_lai_dinh_ky = "Nhận 1 lần vào cuối kỳ"
-            else:
-                lai_ky_1 = so_tien_gui * r * (f / 12)
-                ghi_chu_lai_dinh_ky = f"Kỳ đầu: {lai_ky_1:,.0f} VNĐ (Tăng dần các kỳ sau)"
+            col3.metric("Dự báo xu hướng", f"{price_diff:.2f} ({pct_change:.2f}%) 📉 LỖ", delta_color="inverse")
 
-        # Hiển thị kết quả bằng các Metric Card
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.metric(label="Tiền lãi định kỳ", value=ghi_chu_lai_dinh_ky)
-        with c2:
-            st.metric(label="Tổng tiền lãi", value=f"{tong_lai:,.0f} VNĐ")
-        with c3:
-            st.metric(label="Tổng gốc + lãi", value=f"{tong_tien:,.0f} VNĐ")
-            
-        # Hiển thị chi tiết bảng tính nếu là lãi kép và nhận định kỳ
-        if loai_lai == "Lãi kép" and hinh_thuc != "Lãnh lãi cuối kỳ":
-            st.markdown("---")
-            st.markdown("**Bảng minh họa lãi kép qua các kỳ:**")
-            
-            data = []
-            goc_hien_tai = so_tien_gui
-            for i in range(1, int(so_ky) + 1):
-                lai_ky_nay = goc_hien_tai * r * (f / 12)
-                goc_hien_tai += lai_ky_nay
-                data.append({
-                    "Kỳ": f"Kỳ {i}",
-                    "Tiền lãi trong kỳ (VNĐ)": round(lai_ky_nay, 0),
-                    "Tổng số dư (Gốc + Lãi)": round(goc_hien_tai, 0)
-                })
-                
-            st.dataframe(data, use_container_width=True)
+        # 6. CHỈ SỐ ĐÁNH GIÁ MÔ HÌNH
+        st.subheader("2. 🎯 Chỉ số đánh giá mô hình")
+        col4, col5 = st.columns(2)
+        col4.info(f"**RMSE (Root Mean Square Error):** {rmse:.4f}")
+        col5.info(f"**MAE (Mean Absolute Error):** {mae:.4f}")
 
-if __name__ == "__main__":
-    main()
+        # 7. BẢNG DỰ BÁO GIÁ TƯƠNG LAI
+        st.subheader(f"3. 📅 Bảng dự báo giá {future_days} ngày tới")
+        df_future = pd.DataFrame({
+            "Ngày dự báo": [d.strftime('%Y-%m-%d') for d in future_dates],
+            "Giá đóng cửa dự báo": [f"{val[0]:.2f}" for val in future_predictions]
+        })
+        st.dataframe(df_future, use_container_width=True)
+
+        # 8. BIỂU ĐỒ TRỰC QUAN HÓA
+        st.subheader("4. 📉 Biểu đồ Trực quan hóa Dữ liệu & Dự báo")
+        
+        train = data[:training_data_len]
+        valid = data[training_data_len:].copy()
+        valid = valid.iloc[:len(predictions)] # Cắt cho khớp kích thước
+        valid['Predictions'] = predictions
+
+        fig = go.Figure()
+        
+        # Plot Train
+        fig.add_trace(go.Scatter(x=train.index, y=train['Close'], mode='lines', name='Dữ liệu Train (Thực tế)'))
+        # Plot Test Actual
+        fig.add_trace(go.Scatter(x=valid.index, y=valid['Close'], mode='lines', name='Dữ liệu Test (Thực tế)'))
+        # Plot Test Predictions
+        fig.add_trace(go.Scatter(x=valid.index, y=valid['Predictions'], mode='lines', name='Dự đoán trên tập Test'))
+        # Plot Future Predictions
+        fig.add_trace(go.Scatter(x=future_dates, y=future_predictions.flatten(), mode='lines+markers', name=f'Dự báo {future_days} ngày tới', line=dict(color='red', width=2, dash='dot')))
+        
+        fig.update_layout(title=f"Biểu đồ giá cổ phiếu {ticker} và Dự báo",
+                          xaxis_title="Thời gian",
+                          yaxis_title="Giá đóng cửa",
+                          template="plotly_white",
+                          height=600)
+        
+        st.plotly_chart(fig, use_container_width=True)
