@@ -1,11 +1,11 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-# Import các thư viện cần thiết cho LSTM và xử lý dữ liệu (ví dụ: yfinance, sklearn, tensorflow/keras)
-# import yfinance as yf
-# from sklearn.preprocessing import MinMaxScaler
-# from tensorflow.keras.models import Sequential
-# from tensorflow.keras.layers import Dense, LSTM
+import yfinance as yf
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, LSTM
+import datetime
 
 # --- CẤU HÌNH TRANG ---
 st.set_page_config(
@@ -26,53 +26,114 @@ with st.sidebar:
     
     future_days = st.slider("Số ngày muốn dự báo tương lai", min_value=1, max_value=30, value=10)
     
-    epochs = st.slider("Số Epochs huấn luyện", min_value=1, max_value=100, value=10)
+    epochs = st.slider("Số Epochs huấn luyện", min_value=1, max_value=50, value=5) # Giảm epoch mặc định để test nhanh hơn
     
     start_button = st.button("🚀 Bắt Đầu Dự Báo", type="primary", use_container_width=True)
 
 # --- NỘI DUNG CHÍNH ---
 st.title("📈 Ứng Dụng Dự Báo Giá Cổ Phiếu bằng Mô Hình LSTM")
-st.write("Dự báo xu hướng giá cổ phiếu trong ngắn hạn và tính toán phần trăm Lãi / Lỗ kỳ vọng.")
+st.write("Dự báo xu hướng giá cổ phiếu trong ngắn hạn dựa trên dữ liệu lịch sử.")
 
 if not start_button:
     st.info("👈 Vui lòng bấm nút '🚀 Bắt Đầu Dự Báo' ở thanh bên trái để khởi chạy mô hình!")
 else:
-    st.write(f"Đang tiến hành dự báo cho mã: **{ticker}**")
-    st.write(f"Dữ liệu từ **{start_date}** đến **{end_date}**")
-    st.write(f"Dự báo **{future_days}** ngày tới, huấn luyện với **{epochs}** epochs.")
+    st.write(f"Đang tiến hành lấy dữ liệu và dự báo cho mã: **{ticker}**")
     
-    # --- LOGIC XỬ LÝ VÀ DỰ BÁO SẼ ĐẶT Ở ĐÂY ---
-    with st.spinner('Đang tải dữ liệu và huấn luyện mô hình...'):
-        # 1. Tải dữ liệu (ví dụ dùng yfinance)
-        # data = yf.download(ticker, start=start_date, end=end_date)
+    try:
+        with st.spinner('Đang tải dữ liệu từ Yahoo Finance và chuẩn bị dữ liệu...'):
+            # 1. Tải dữ liệu
+            data = yf.download(ticker, start=start_date, end=end_date)
+            
+            if data.empty:
+                st.error("Không tìm thấy dữ liệu. Vui lòng kiểm tra lại mã chứng khoán (ví dụ chứng khoán VN cần có đuôi .VN như VNM.VN).")
+                st.stop()
+                
+            # Chỉ lấy cột Close để dự báo
+            df = data[['Close']].copy()
+            dataset = df.values
+            
+            # 2. Tiền xử lý dữ liệu (Scale dữ liệu về khoảng 0-1)
+            scaler = MinMaxScaler(feature_range=(0, 1))
+            scaled_data = scaler.fit_transform(dataset)
+            
+            # Tạo dữ liệu training (dùng 60 ngày gần nhất để dự đoán ngày tiếp theo)
+            look_back = 60
+            if len(scaled_data) < look_back:
+                st.error("Dữ liệu quá ngắn để huấn luyện. Vui lòng chọn khoảng thời gian dài hơn.")
+                st.stop()
+                
+            x_train, y_train = [], []
+            for i in range(look_back, len(scaled_data)):
+                x_train.append(scaled_data[i-look_back:i, 0])
+                y_train.append(scaled_data[i, 0])
+                
+            x_train, y_train = np.array(x_train), np.array(y_train)
+            x_train = np.reshape(x_train, (x_train.shape[0], x_train.shape[1], 1))
+            
+        with st.spinner(f'Đang huấn luyện mô hình LSTM với {epochs} epochs (Quá trình này có thể mất vài phút)...'):
+            # 3. Xây dựng mô hình LSTM
+            model = Sequential()
+            model.add(LSTM(units=50, return_sequences=True, input_shape=(x_train.shape[1], 1)))
+            model.add(LSTM(units=50, return_sequences=False))
+            model.add(Dense(units=25))
+            model.add(Dense(units=1))
+            
+            model.compile(optimizer='adam', loss='mean_squared_error')
+            
+            # Huấn luyện mô hình
+            model.fit(x_train, y_train, batch_size=32, epochs=epochs, verbose=0)
+            
+        with st.spinner('Đang tính toán dự báo cho tương lai...'):
+            # 4. Dự báo tương lai
+            # Lấy 60 ngày cuối cùng để làm dữ liệu nền tảng dự báo tương lai
+            last_60_days = scaled_data[-look_back:]
+            current_batch = last_60_days.reshape((1, look_back, 1))
+            
+            future_predictions_scaled = []
+            
+            for _ in range(future_days):
+                # Dự đoán ngày tiếp theo
+                next_pred = model.predict(current_batch, verbose=0)
+                future_predictions_scaled.append(next_pred[0, 0])
+                
+                # Cập nhật lại batch (bỏ ngày cũ nhất, thêm dự đoán mới vào)
+                next_pred_reshaped = next_pred.reshape((1, 1, 1))
+                current_batch = np.append(current_batch[:, 1:, :], next_pred_reshaped, axis=1)
+            
+            # Đảo ngược scale để ra giá trị thật
+            future_predictions = scaler.inverse_transform(np.array(future_predictions_scaled).reshape(-1, 1))
+            
+        st.success("Dự báo hoàn tất!")
         
-        # 2. Tiền xử lý dữ liệu (MinMaxScaler, tạo dataset cho LSTM)
+        # --- HIỂN THỊ KẾT QUẢ ---
+        st.subheader(f"Kết quả dự báo {future_days} ngày tới cho {ticker}")
         
-        # 3. Xây dựng và huấn luyện mô hình LSTM
+        # Tạo danh sách ngày trong tương lai
+        last_date = df.index[-1]
+        future_dates = [last_date + datetime.timedelta(days=i) for i in range(1, future_days + 1)]
         
-        # 4. Thực hiện dự báo tương lai
+        # Biểu diễn dữ liệu bằng DataFrame
+        df_pred = pd.DataFrame({
+            'Ngày': future_dates,
+            'Giá Dự Báo': future_predictions.flatten()
+        })
+        df_pred.set_index('Ngày', inplace=True)
         
-        import time
-        time.sleep(2) # Giả lập thời gian chạy
+        # Vẽ biểu đồ kết hợp dữ liệu lịch sử và dự báo
+        # Lấy một phần dữ liệu quá khứ gần nhất (ví dụ 100 ngày) để hiển thị cho đẹp
+        past_display = df.tail(100)
         
-    st.success("Dự báo hoàn tất! (Đây là dữ liệu mô phỏng)")
-    
-    # --- HIỂN THỊ KẾT QUẢ ---
-    st.subheader("Kết quả dự báo")
-    
-    # Tạo dữ liệu giả để vẽ biểu đồ
-    dates = pd.date_range(start=end_date, periods=future_days + 1)[1:]
-    simulated_prices = np.random.normal(loc=100, scale=2, size=future_days)
-    
-    df_pred = pd.DataFrame({'Ngày': dates, 'Giá Dự Báo': simulated_prices})
-    st.line_chart(df_pred.set_index('Ngày'))
-    
-    st.write(df_pred)
+        # Hiển thị biểu đồ bằng st.line_chart
+        st.write("Biểu đồ giá lịch sử (100 ngày qua) và dự báo:")
+        chart_data = pd.DataFrame({'Giá Lịch Sử': past_display['Close']})
+        # Ghép nối tiếp dữ liệu dự báo vào
+        pred_chart_data = pd.DataFrame({'Giá Dự Báo': df_pred['Giá Dự Báo']})
+        
+        combined_data = pd.concat([chart_data, pred_chart_data])
+        st.line_chart(combined_data)
+        
+        st.write("Bảng giá dự báo chi tiết:")
+        st.dataframe(df_pred.style.format("{:.2f}"))
 
-# --- CSS TÙY CHỈNH (Tùy chọn) ---
-# Thêm CSS để giống giao diện dark mode trong hình hơn
-st.markdown("""
-<style>
-    /* CSS tùy chỉnh có thể thêm vào đây */
-</style>
-""", unsafe_allow_html=True)
+    except Exception as e:
+        st.error(f"Đã xảy ra lỗi trong quá trình xử lý: {e}")
